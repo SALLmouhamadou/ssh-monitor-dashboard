@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
+import re
+import io
+import os
 
 # Configuration de la page
 st.set_page_config(
@@ -10,6 +13,88 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# ============================================================================
+# FONCTION DE PARSING DES LOGS SSH
+# ============================================================================
+
+def parse_ssh_log(log_content):
+    """
+    Parse un fichier de log SSH brut et retourne un DataFrame au format attendu.
+    Format attendu: Timestamp, EventId, SourceIP, User, Raw_Message
+    """
+    
+    # Patterns regex pour extraire les informations
+    patterns = {
+        'E27': r'POSSIBLE BREAK-IN ATTEMPT',
+        'E13': r'Invalid user (\w+) from',
+        'E12': r'input_userauth_request: invalid user',
+        'E21': r'pam_unix\(sshd:auth\): check pass; user unknown',
+        'E19': r'pam_unix\(sshd:auth\): authentication failure',
+        'E20': r'pam_unix\(sshd:auth\): authentication failure.*root',
+        'E10': r'Failed password for invalid user',
+        'E9': r'Failed password for root',
+        'E2': r'Connection closed by',
+        'E5': r'Too many authentication failures',
+        'E17': r'PAM \d+ more authentication failures',
+        'E18': r'PAM service\(sshd\) ignoring max retries',
+        'E24': r'Received disconnect from',
+        'E14': r'message repeated'
+    }
+    
+    # Pattern pour extraire l'IP
+    ip_pattern = r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
+    # Pattern pour extraire l'utilisateur
+    user_patterns = [
+        r'Invalid user (\w+) from',
+        r'Failed password for invalid user (\w+) from',
+        r'Failed password for (\w+) from',
+        r'user[=: ]+(\w+)',
+        r'Accepted password for (\w+) from'
+    ]
+    # Pattern pour le timestamp
+    timestamp_pattern = r'^([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})'
+    
+    parsed_data = []
+    
+    lines = log_content.split('\n')
+    
+    for line in lines:
+        if not line.strip() or 'sshd' not in line.lower():
+            continue
+        
+        # Extraire le timestamp
+        timestamp_match = re.search(timestamp_pattern, line)
+        timestamp = timestamp_match.group(1) if timestamp_match else 'None'
+        
+        # Déterminer le type d'événement
+        event_id = 'E0'  # Événement inconnu par défaut
+        for evt_id, pattern in patterns.items():
+            if re.search(pattern, line, re.IGNORECASE):
+                event_id = evt_id
+                break
+        
+        # Extraire l'IP source
+        ip_match = re.search(ip_pattern, line)
+        source_ip = ip_match.group(1) if ip_match else 'None'
+        
+        # Extraire l'utilisateur
+        user = 'None'
+        for user_pat in user_patterns:
+            user_match = re.search(user_pat, line, re.IGNORECASE)
+            if user_match:
+                user = user_match.group(1)
+                break
+        
+        parsed_data.append({
+            'Timestamp': timestamp,
+            'EventId': event_id,
+            'SourceIP': source_ip,
+            'User': user,
+            'Raw_Message': line.strip()
+        })
+    
+    return pd.DataFrame(parsed_data)
 
 # Fonction de chargement des données avec cache
 @st.cache_data
@@ -95,6 +180,72 @@ EVENT_DESCRIPTIONS = {
 
 # Titre principal
 st.title("🛡️ SSH Security Monitor Dashboard")
+st.markdown("---")
+
+# ============================================================================
+# SECTION UPLOAD DE FICHIER LOG
+# ============================================================================
+
+with st.expander("📤 Importer un nouveau fichier de logs SSH", expanded=False):
+    st.markdown("""
+    **Instructions :** Uploadez un fichier de logs SSH brut (.log ou .txt).
+    Le fichier sera automatiquement parsé et les données seront sauvegardées dans `datasetssh.csv`.
+    """)
+    
+    uploaded_file = st.file_uploader(
+        "Choisir un fichier de logs SSH",
+        type=['log', 'txt'],
+        help="Formats acceptés: .log, .txt - Le fichier doit contenir des logs SSH au format syslog"
+    )
+    
+    if uploaded_file is not None:
+        # Lire le contenu du fichier
+        log_content = uploaded_file.read().decode('utf-8', errors='ignore')
+        
+        # Afficher un aperçu
+        st.markdown("**📋 Aperçu du fichier (5 premières lignes) :**")
+        preview_lines = log_content.split('\n')[:5]
+        for line in preview_lines:
+            st.code(line, language="text")
+        
+        col_btn1, col_btn2 = st.columns(2)
+        
+        with col_btn1:
+            if st.button("🔄 Parser et sauvegarder", type="primary", use_container_width=True):
+                with st.spinner("Parsing du fichier en cours..."):
+                    # Parser le fichier
+                    df_parsed = parse_ssh_log(log_content)
+                    
+                    if len(df_parsed) > 0:
+                        # Sauvegarder dans datasetssh.csv
+                        df_parsed.to_csv('datasetssh.csv', index=False)
+                        
+                        # Vider le cache pour recharger les nouvelles données
+                        st.cache_data.clear()
+                        
+                        st.success(f"✅ {len(df_parsed)} événements parsés et sauvegardés avec succès!")
+                        st.info("🔄 Rechargement automatique des données...")
+                        
+                        # Afficher les statistiques du parsing
+                        st.markdown("**📊 Résumé du parsing :**")
+                        col_s1, col_s2, col_s3 = st.columns(3)
+                        with col_s1:
+                            st.metric("Total événements", len(df_parsed))
+                        with col_s2:
+                            st.metric("Types d'événements", df_parsed['EventId'].nunique())
+                        with col_s3:
+                            valid_ips = df_parsed[df_parsed['SourceIP'] != 'None']
+                            st.metric("IPs uniques", valid_ips['SourceIP'].nunique())
+                        
+                        # Rerun pour afficher les nouvelles données
+                        st.rerun()
+                    else:
+                        st.error("❌ Aucun événement SSH trouvé dans le fichier. Vérifiez que le format est correct.")
+        
+        with col_btn2:
+            if st.button("❌ Annuler", use_container_width=True):
+                st.rerun()
+
 st.markdown("---")
 
 # Chargement des données
@@ -336,6 +487,19 @@ if df is not None:
     # ========================================================================
     # VISUALISATIONS
     # ========================================================================
+
+
+    """" 
+    Ce bloc de code configure une section d'analyse visuelle dans une application Streamlit. 
+    Il commence par afficher un titre principal ("Analyses Détaillées") et divise l'écran en deux colonnes égales. 
+    Le code se concentre ensuite sur la colonne de gauche pour analyser les "IPs Agressives". Il appelle d'abord 
+    une fonction (get_top_ips) pour récupérer les 5 adresses IP les plus actives à partir d'un DataFrame filtré.
+
+    Si des données sont trouvées, le script génère un graphique à barres horizontales via la bibliothèque Matplotlib 
+    (avec une palette de couleurs rouges pour signifier l'urgence), l'affiche dans l'interface, et ajoute un menu déroulant (expander)
+    contenant le tableau des données brutes. Si aucune donnée n'est trouvée (le else à la fin), des messages d'avertissement informatifs
+    sont affichés pour guider l'utilisateur.
+   """
     st.header("📈 Analyses Détaillées")
     
     # Créer deux colonnes pour les graphiques
@@ -374,32 +538,74 @@ if df is not None:
             st.info("💡 Essayez d'élargir votre sélection d'IPs ou de types d'événements.")
     
     # ---- COLONNE DROITE : Évolution Temporelle ----
+    
     with col_right:
         st.subheader("⏰ Évolution Temporelle des Attaques")
         
         hourly_data = get_temporal_evolution(df_filtered)
         
         if not hourly_data.empty and len(hourly_data) > 0:
-            # Créer un graphique matplotlib
+            # Créer un graphique matplotlib amélioré
             fig, ax = plt.subplots(figsize=(10, 6))
-            ax.plot(hourly_data.index, hourly_data.values, 
-                   marker='o', linewidth=2, markersize=6, color='#4444ff')
-            ax.fill_between(hourly_data.index, hourly_data.values, alpha=0.3, color='#4444ff')
-            ax.set_xlabel('Heure', fontsize=12)
+            
+            # Formater les heures pour l'affichage
+            hours_formatted = [h.strftime('%d/%m\n%H:%M') for h in hourly_data.index]
+            x_positions = range(len(hourly_data))
+            
+            # Graphique en barres pour plus de clarté
+            bars = ax.bar(x_positions, hourly_data.values, 
+                         color='#4a90d9', edgecolor='#2c5282', alpha=0.8)
+            
+            # Ligne de tendance
+            ax.plot(x_positions, hourly_data.values, 
+                   color='#e53e3e', linewidth=2, marker='o', markersize=4, label='Tendance')
+            
+            # Ligne de moyenne
+            moyenne = hourly_data.mean()
+            ax.axhline(y=moyenne, color='#48bb78', linestyle='--', linewidth=2, 
+                      label=f'Moyenne: {moyenne:.0f} évts/h')
+            
+            # Marquer le pic d'activité
+            max_idx = hourly_data.values.argmax()
+            ax.annotate(f'⚠️ Pic: {hourly_data.max()}', 
+                       xy=(max_idx, hourly_data.max()),
+                       xytext=(max_idx, hourly_data.max() + hourly_data.max()*0.1),
+                       fontsize=10, fontweight='bold', color='#e53e3e',
+                       ha='center')
+            
+            # Configurer les axes
+            ax.set_xticks(x_positions)
+            ax.set_xticklabels(hours_formatted, fontsize=8)
+            ax.set_xlabel('Date et Heure', fontsize=12)
             ax.set_ylabel('Nombre d\'événements', fontsize=12)
-            ax.set_title('Distribution des événements par heure', fontsize=14, fontweight='bold')
-            ax.grid(True, alpha=0.3)
-            plt.xticks(rotation=45, ha='right')
+            ax.set_title('📊 Activité par Tranche Horaire', fontsize=14, fontweight='bold')
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.legend(loc='upper right', fontsize=9)
+            
+            # Réduire le nombre de labels si trop nombreux
+            if len(x_positions) > 10:
+                step = len(x_positions) // 10
+                ax.set_xticks([x for i, x in enumerate(x_positions) if i % step == 0])
+                ax.set_xticklabels([h for i, h in enumerate(hours_formatted) if i % step == 0], fontsize=8)
+            
             plt.tight_layout()
             
             st.pyplot(fig)
             
-            # Statistiques temporelles
+            # Statistiques temporelles améliorées
             with st.expander("📋 Statistiques horaires"):
                 if len(hourly_data) > 0:
-                    st.write(f"**Heure la plus active :** {hourly_data.idxmax().strftime('%H:%M')} ({hourly_data.max()} événements)")
-                    st.write(f"**Heure la moins active :** {hourly_data.idxmin().strftime('%H:%M')} ({hourly_data.min()} événements)")
-                    st.write(f"**Moyenne par heure :** {hourly_data.mean():.1f} événements")
+                    col_stat1, col_stat2 = st.columns(2)
+                    with col_stat1:
+                        st.metric("🔴 Pic d'activité", 
+                                 f"{hourly_data.idxmax().strftime('%d/%m %H:%M')}", 
+                                 f"{hourly_data.max()} événements")
+                        st.metric("📊 Moyenne/heure", f"{hourly_data.mean():.1f}")
+                    with col_stat2:
+                        st.metric("🟢 Période calme", 
+                                 f"{hourly_data.idxmin().strftime('%d/%m %H:%M')}", 
+                                 f"{hourly_data.min()} événements")
+                        st.metric("📈 Total périodes", f"{len(hourly_data)}")
         else:
             st.warning("⚠️ Aucune donnée temporelle disponible pour les filtres sélectionnés.")
             st.info("💡 Essayez d'élargir votre plage horaire.")
@@ -416,33 +622,60 @@ if df is not None:
         col_chart, col_table = st.columns([2, 1])
         
         with col_chart:
-            # Graphique en camembert
+            # Graphique en barres horizontales
             fig, ax = plt.subplots(figsize=(10, 6))
-            colors_pie = plt.cm.Set3(range(len(event_counts)))
-            wedges, texts, autotexts = ax.pie(
-                event_counts.values,
-                labels=[f"{evt}\n{EVENT_DESCRIPTIONS.get(evt, 'Unknown')}" for evt in event_counts.index],
-                autopct='%1.1f%%',
-                startangle=90,
-                colors=colors_pie
-            )
-            for autotext in autotexts:
-                autotext.set_color('white')
-                autotext.set_fontweight('bold')
+            colors_bar = plt.cm.Set3(range(len(event_counts)))
+            
+            # Créer les labels avec description
+            labels = [f"{evt} - {EVENT_DESCRIPTIONS.get(evt, 'Unknown')}" for evt in event_counts.index]
+            
+            # Graphique en barres horizontales
+            bars = ax.barh(labels, event_counts.values, color=colors_bar)
+            
+            # Ajouter les pourcentages à la fin de chaque barre
+            total = event_counts.sum()
+            for bar, value in zip(bars, event_counts.values):
+                percentage = (value / total) * 100
+                ax.text(bar.get_width() + 0.5, bar.get_y() + bar.get_height()/2, 
+                       f'{percentage:.1f}%', va='center', fontsize=9)
+            
+            ax.set_xlabel('Nombre d\'événements', fontsize=12)
+            ax.set_ylabel('Type d\'événement', fontsize=12)
             ax.set_title('Répartition des types d\'événements', fontsize=14, fontweight='bold')
+            ax.invert_yaxis()  # Pour avoir le plus grand en haut
             plt.tight_layout()
             
             st.pyplot(fig)
         
         with col_table:
             st.markdown("##### 📊 Détails")
-            event_df = pd.DataFrame({
-                'Type': event_counts.index,
-                'Description': [EVENT_DESCRIPTIONS.get(evt, 'Unknown') for evt in event_counts.index],
-                'Nombre': event_counts.values,
-                'Pourcentage': [f"{(v/event_counts.sum()*100):.1f}%" for v in event_counts.values]
-            })
-            st.dataframe(event_df, use_container_width=True, hide_index=True)
+            
+            # Graphique circulaire
+            fig_pie, ax_pie = plt.subplots(figsize=(6, 6))
+            colors_pie = plt.cm.Set3(range(len(event_counts)))
+            wedges, texts, autotexts = ax_pie.pie(
+                event_counts.values,
+                labels=event_counts.index,
+                autopct='%1.1f%%',
+                startangle=90,
+                colors=colors_pie
+            )
+            for autotext in autotexts:
+                autotext.set_fontsize(8)
+                autotext.set_fontweight('bold')
+            ax_pie.set_title('Distribution', fontsize=12, fontweight='bold')
+            plt.tight_layout()
+            st.pyplot(fig_pie)
+            
+            # Tableau des données
+            with st.expander("📋 Voir le tableau"):
+                event_df = pd.DataFrame({
+                    'Type': event_counts.index,
+                    'Description': [EVENT_DESCRIPTIONS.get(evt, 'Unknown') for evt in event_counts.index],
+                    'Nombre': event_counts.values,
+                    'Pourcentage': [f"{(v/event_counts.sum()*100):.1f}%" for v in event_counts.values]
+                })
+                st.dataframe(event_df, use_container_width=True, hide_index=True)
     else:
         st.warning("⚠️ Aucune donnée d'événement disponible.")
     
